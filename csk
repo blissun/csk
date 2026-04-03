@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# csk — Claude Skills Kit
+# Install, manage, and toggle skill packs for Claude Code.
+# https://github.com/blissun/csk
+set -e
+
+CSK_VERSION="0.1.0"
+CSK_DIR="$HOME/.csk"
+CSK_REGISTRY="$CSK_DIR/registry"
+SKILLS_DIR="$HOME/.claude/skills"
+DISABLED_DIR="$SKILLS_DIR/.csk-disabled"
+
+mkdir -p "$CSK_DIR" "$CSK_REGISTRY" "$DISABLED_DIR"
+
+# ─── Colors ──────────────────────────────────────────────
+R="\033[0m" B="\033[1m" G="\033[32m" D="\033[90m" Y="\033[33m" C="\033[36m"
+
+# ─── Built-in pack registry ─────────────────────────────
+# Format: name|git_url|setup_cmd|description
+BUILTIN_PACKS=(
+  "gstack|https://github.com/garrytan/gstack.git|./setup --host claude --no-prefix|Garry's Stack — AI 엔지니어링 워크플로 (QA, 리뷰, 배포, 디자인, 브라우저)"
+)
+
+# ─── Pack registry helpers ───────────────────────────────
+pack_field() {
+  local pack="$1" field="$2"
+  # Check built-in first
+  for entry in "${BUILTIN_PACKS[@]}"; do
+    IFS='|' read -r name url cmd desc <<< "$entry"
+    if [ "$name" = "$pack" ]; then
+      case "$field" in
+        url) echo "$url" ;; cmd) echo "$cmd" ;; desc) echo "$desc" ;;
+      esac
+      return 0
+    fi
+  done
+  # Check user-added registry
+  if [ -f "$CSK_REGISTRY/$pack.conf" ]; then
+    case "$field" in
+      url)  grep '^url=' "$CSK_REGISTRY/$pack.conf" | cut -d= -f2- ;;
+      cmd)  grep '^cmd=' "$CSK_REGISTRY/$pack.conf" | cut -d= -f2- ;;
+      desc) grep '^desc=' "$CSK_REGISTRY/$pack.conf" | cut -d= -f2- ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+pack_exists() { pack_field "$1" url >/dev/null 2>&1; }
+
+installed_packs() {
+  for d in "$SKILLS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    local name="$(basename "$d")"
+    [[ "$name" == .* ]] && continue
+    # A pack has subdirs with SKILL.md
+    local has_skills=0
+    for sd in "$d"/*/; do
+      [ -f "$sd/SKILL.md" ] && has_skills=1 && break
+    done
+    [ "$has_skills" -eq 1 ] && echo "$name"
+  done | sort
+}
+
+# ─── Skills from a pack ─────────────────────────────────
+pack_skills() {
+  local pack="$1"
+  local pd="$SKILLS_DIR/$pack"
+  [ -d "$pd" ] || return
+  for d in "$pd"/*/; do
+    [ -f "$d/SKILL.md" ] || continue
+    local b="$(basename "$d")"
+    [ "$b" = "node_modules" ] && continue
+    echo "$b"
+  done | sort
+}
+
+all_skills() {
+  while IFS= read -r pack; do
+    while IFS= read -r skill; do
+      echo "$pack/$skill"
+    done < <(pack_skills "$pack")
+  done < <(installed_packs)
+}
+
+skill_on?() { [ -L "$SKILLS_DIR/$1" ]; }
+
+# ─── Korean help database ───────────────────────────────
+declare -A HELP_KO=(
+  [autoplan]="자동 리뷰 파이프라인. CEO/디자인/엔지니어링 리뷰를 순차 실행하고 판단 필요 시만 질문"
+  [benchmark]="성능 회귀 감지. 페이지 로드, Core Web Vitals, 리소스 크기 기준선 비교"
+  [browse]="헤드리스 브라우저. URL 탐색, 요소 조작, 스크린샷, 반응형/폼/업로드 테스트"
+  [canary]="배포 후 카나리 모니터링. 콘솔 에러, 성능 저하, 페이지 실패 감지 및 알림"
+  [careful]="위험 명령 안전장치. rm -rf, DROP TABLE, force-push 등 실행 전 경고"
+  [codex]="OpenAI Codex CLI. 코드 리뷰(pass/fail), 챌린지(적대적 테스트), 컨설트(질의)"
+  [connect-chrome]="실제 Chrome을 gstack으로 제어. 사이드 패널에서 실시간 활동 확인"
+  [cso]="보안 감사. 시크릿/의존성/CI·CD/OWASP Top 10/STRIDE 위협 모델링"
+  [design-consultation]="디자인 컨설팅. 제품 이해→경쟁 조사→디자인 시스템 제안→DESIGN.md 생성"
+  [design-html]="AI 목업을 프로덕션 HTML/CSS로 변환. 30KB, 의존성 없음"
+  [design-review]="디자이너 시점 QA. 시각적 불일치/간격/계층 문제 찾아 소스에서 직접 수정"
+  [design-shotgun]="디자인 변형 다수 생성 → 비교 보드 → 피드백 수집 → 반복"
+  [document-release]="배포 후 문서 갱신. diff 기반 README/ARCHITECTURE/CHANGELOG 자동 업데이트"
+  [freeze]="디렉토리 잠금. 지정 경로 외부 편집 차단"
+  [gstack-upgrade]="gstack 최신 버전 업그레이드"
+  [guard]="최대 안전 모드. careful(위험 경고) + freeze(디렉토리 잠금)"
+  [investigate]="체계적 디버깅. 조사→분석→가설→구현. 근본 원인 없이 수정 금지"
+  [land-and-deploy]="PR 머지 → CI/배포 대기 → 프로덕션 카나리 헬스체크"
+  [learn]="프로젝트 학습 관리. 세션 간 학습 내용 조회/검색/정리/내보내기"
+  [office-hours]="YC 오피스 아워. 스타트업(수요 검증 6문항) / 빌더(디자인 씽킹)"
+  [plan-ceo-review]="CEO 모드 플랜 리뷰. 10점짜리 제품 찾기, 전제 도전, 범위 확장"
+  [plan-design-review]="디자이너 시점 플랜 리뷰. 각 차원 0-10 평가 후 10점 방법 제시"
+  [plan-eng-review]="엔지니어링 매니저 플랜 리뷰. 아키텍처/데이터 흐름/엣지케이스/테스트"
+  [qa]="웹앱 QA + 버그 수정. 테스트→발견→소스 수정→커밋→재검증 반복"
+  [qa-only]="리포트 전용 QA. 버그 리포트만 생성, 코드 수정 없음"
+  [retro]="주간 엔지니어링 회고. 커밋/작업 패턴/코드 품질 분석, 팀원별 기여도"
+  [review]="PR 코드 리뷰. SQL 안전성, LLM 신뢰 경계, 조건부 사이드이펙트 분석"
+  [setup-browser-cookies]="실제 브라우저 쿠키를 헤드리스 세션에 임포트. 인증 페이지 QA용"
+  [setup-deploy]="배포 설정. Fly.io/Render/Vercel/Netlify/Heroku 등 플랫폼 자동 감지"
+  [ship]="배포 워크플로. 테스트→리뷰→VERSION 범프→CHANGELOG→커밋→PR 생성"
+  [unfreeze]="freeze 디렉토리 잠금 해제"
+)
+
+# ─── Commands ────────────────────────────────────────────
+
+cmd_install() {
+  local pack="$1"
+  if ! pack_exists "$pack"; then
+    echo -e "  ${Y}✗${R} 팩 '$pack'을(를) 찾을 수 없습니다" >&2
+    echo "  등록된 팩: $(cmd_registry | tr '\n' ' ')" >&2
+    return 1
+  fi
+
+  local url; url="$(pack_field "$pack" url)"
+  local cmd; cmd="$(pack_field "$pack" cmd)"
+  local desc; desc="$(pack_field "$pack" desc)"
+  local dest="$SKILLS_DIR/$pack"
+
+  echo -e "\n  ${B}$pack${R} 설치 중..."
+  [ -n "$desc" ] && echo -e "  ${D}$desc${R}\n"
+
+  # Clone or update
+  if [ -d "$dest/.git" ]; then
+    echo "  기존 설치 발견 — 업데이트 중..."
+    git -C "$dest" pull --ff-only 2>&1 | sed 's/^/  /'
+  else
+    [ -d "$dest" ] && rm -rf "$dest"
+    git clone "$url" "$dest" 2>&1 | sed 's/^/  /'
+  fi
+
+  # Run pack setup
+  if [ -n "$cmd" ]; then
+    echo -e "\n  셋업 실행: ${D}$cmd${R}"
+    (cd "$dest" && eval "$cmd") 2>&1 | sed 's/^/  /'
+  fi
+
+  # Count installed skills
+  local count=0
+  while IFS= read -r _; do count=$((count+1)); done < <(pack_skills "$pack")
+  echo -e "\n  ${G}✓${R} ${B}$pack${R} 설치 완료 — ${G}$count${R}개 스킬\n"
+}
+
+cmd_uninstall() {
+  local pack="$1"
+  local dest="$SKILLS_DIR/$pack"
+  if [ ! -d "$dest" ]; then
+    echo "  ✗ '$pack'이(가) 설치되어 있지 않습니다" >&2; return 1
+  fi
+
+  # Remove symlinks
+  while IFS= read -r skill; do
+    [ -L "$SKILLS_DIR/$skill" ] && rm -f "$SKILLS_DIR/$skill"
+    rm -f "$DISABLED_DIR/$skill"
+  done < <(pack_skills "$pack")
+
+  rm -rf "$dest"
+  echo -e "  ${G}✓${R} ${B}$pack${R} 제거 완료"
+}
+
+cmd_update() {
+  local pack="${1:-}"
+  if [ -z "$pack" ]; then
+    while IFS= read -r p; do cmd_install "$p"; done < <(installed_packs)
+  else
+    cmd_install "$pack"
+  fi
+}
+
+cmd_ls() {
+  local packs; packs="$(installed_packs)"
+  if [ -z "$packs" ]; then
+    echo -e "\n  설치된 팩이 없습니다. ${D}csk install gstack${R} 으로 시작하세요\n"
+    return
+  fi
+
+  while IFS= read -r pack; do
+    local t=0 e=0 d=0
+    printf "\n  ${B}[%s]${R}\n" "$pack"
+    while IFS= read -r s; do
+      t=$((t+1))
+      if skill_on? "$s"; then
+        e=$((e+1)); printf "  %-28s ${G}● ON${R}\n" "$s"
+      else
+        d=$((d+1)); printf "  %-28s ${D}○ OFF${R}\n" "$s"
+      fi
+    done < <(pack_skills "$pack")
+    printf "  ${D}— %d개 스킬 | ON: %d | OFF: %d${R}\n" "$t" "$e" "$d"
+  done <<< "$packs"
+  echo
+}
+
+cmd_on() {
+  local skill="$1" found=0
+  if [ "$skill" = "all" ]; then
+    while IFS= read -r pack; do
+      while IFS= read -r s; do cmd_on_single "$pack" "$s"; done < <(pack_skills "$pack")
+    done < <(installed_packs)
+    return
+  fi
+  # Find which pack owns this skill
+  while IFS= read -r pack; do
+    if [ -d "$SKILLS_DIR/$pack/$skill" ] && [ -f "$SKILLS_DIR/$pack/$skill/SKILL.md" ]; then
+      cmd_on_single "$pack" "$skill"; found=1; break
+    fi
+  done < <(installed_packs)
+  if [ "$found" -eq 0 ]; then echo "  ✗ '$skill' not found" >&2; return 1; fi
+}
+
+cmd_on_single() {
+  local pack="$1" skill="$2"
+  if skill_on? "$skill"; then echo "  $skill — already ON"; return; fi
+  ln -snf "$pack/$skill" "$SKILLS_DIR/$skill"
+  rm -f "$DISABLED_DIR/$skill"
+  echo "  $skill → ON"
+}
+
+cmd_off() {
+  local skill="$1" found=0
+  if [ "$skill" = "all" ]; then
+    while IFS= read -r pack; do
+      while IFS= read -r s; do cmd_off_single "$s"; done < <(pack_skills "$pack")
+    done < <(installed_packs)
+    return
+  fi
+  while IFS= read -r pack; do
+    if [ -d "$SKILLS_DIR/$pack/$skill" ] && [ -f "$SKILLS_DIR/$pack/$skill/SKILL.md" ]; then
+      cmd_off_single "$skill"; found=1; break
+    fi
+  done < <(installed_packs)
+  if [ "$found" -eq 0 ]; then echo "  ✗ '$skill' not found" >&2; return 1; fi
+}
+
+cmd_off_single() {
+  local skill="$1"
+  skill_on? "$skill" || { echo "  $skill — already OFF"; return; }
+  rm -f "$SKILLS_DIR/$skill"
+  touch "$DISABLED_DIR/$skill"
+  echo "  $skill → OFF"
+}
+
+cmd_help_one() {
+  local skill="$1" found=0
+  while IFS= read -r pack; do
+    if [ -d "$SKILLS_DIR/$pack/$skill" ]; then
+      found=1
+      local st; skill_on? "$skill" && st="${G}● ON${R}" || st="${D}○ OFF${R}"
+      printf "\n  ${B}/%s${R}  %b  ${D}(%s)${R}\n" "$skill" "$st" "$pack"
+      if [ -n "${HELP_KO[$skill]:-}" ]; then
+        printf "  %s\n\n" "${HELP_KO[$skill]}"
+      else
+        sed -n '/^description:/,/^[a-z]*:/{s/^description:[[:space:]]*//p;s/^  //p;}' \
+          "$SKILLS_DIR/$pack/$skill/SKILL.md" 2>/dev/null | head -2 | while read -r l; do printf "  %s\n" "$l"; done
+        printf "\n"
+      fi
+      break
+    fi
+  done < <(installed_packs)
+  if [ "$found" -eq 0 ]; then echo "  ✗ '$skill' not found" >&2; return 1; fi
+}
+
+cmd_help_all() {
+  while IFS= read -r pack; do
+    printf "\n  ${B}[%s]${R}\n\n" "$pack"
+    while IFS= read -r s; do
+      local st; skill_on? "$s" && st="${G}●${R}" || st="${D}○${R}"
+      local desc="${HELP_KO[$s]:-}"
+      if [ -z "$desc" ]; then
+        desc=$(sed -n '/^description:/{ s/^description:[[:space:]]*//; p; q; }' \
+          "$SKILLS_DIR/$pack/$s/SKILL.md" 2>/dev/null)
+      fi
+      printf "  %b %-24s %s\n" "$st" "$s" "${desc:-(설명 없음)}"
+    done < <(pack_skills "$pack")
+  done < <(installed_packs)
+  echo
+}
+
+cmd_packs() {
+  printf "\n  ${B}설치된 팩${R}\n\n"
+  local has=0
+  while IFS= read -r pack; do
+    has=1
+    local count=0
+    while IFS= read -r _; do count=$((count+1)); done < <(pack_skills "$pack")
+    local desc; desc="$(pack_field "$pack" desc 2>/dev/null || echo "")"
+    printf "  ${G}●${R} %-20s ${D}%d개 스킬${R}" "$pack" "$count"
+    [ -n "$desc" ] && printf "  ${D}— %s${R}" "$desc"
+    printf "\n"
+  done < <(installed_packs)
+  [ "$has" -eq 0 ] && echo -e "  (없음) — ${D}csk install gstack${R} 으로 시작"
+
+  printf "\n  ${B}등록된 팩${R}\n\n"
+  for entry in "${BUILTIN_PACKS[@]}"; do
+    IFS='|' read -r name url cmd desc <<< "$entry"
+    if [ -d "$SKILLS_DIR/$name" ]; then
+      printf "  ${G}●${R} %-20s ${D}%s${R}\n" "$name" "$desc"
+    else
+      printf "  ${D}○${R} %-20s ${D}%s${R}\n" "$name" "$desc"
+    fi
+  done
+  for f in "$CSK_REGISTRY"/*.conf; do
+    [ -f "$f" ] || continue
+    local name="$(basename "$f" .conf)"
+    local desc; desc="$(grep '^desc=' "$f" | cut -d= -f2-)"
+    if [ -d "$SKILLS_DIR/$name" ]; then
+      printf "  ${G}●${R} %-20s ${D}%s${R}\n" "$name" "$desc"
+    else
+      printf "  ${D}○${R} %-20s ${D}%s${R}\n" "$name" "$desc"
+    fi
+  done
+  echo
+}
+
+cmd_add_pack() {
+  local name="$1" url="$2" setup="${3:-}" desc="${4:-}"
+  if [ -z "$name" ] || [ -z "$url" ]; then
+    echo "csk add <name> <git-url> [setup-cmd] [description]" >&2; return 1
+  fi
+  cat > "$CSK_REGISTRY/$name.conf" <<EOF
+url=$url
+cmd=$setup
+desc=$desc
+EOF
+  echo -e "  ${G}✓${R} 팩 '${B}$name${R}' 등록 완료"
+  echo -e "  ${D}csk install $name${R} 으로 설치하세요"
+}
+
+cmd_gui() {
+  local gui_bin="$HOME/.csk/bin/CSK"
+
+  # Try pre-built binary first
+  if [ -x "$gui_bin" ]; then
+    "$gui_bin" &
+    echo -e "  ${G}✓${R} GUI 실행"
+    return
+  fi
+
+  # Find source: check known locations
+  local gui_src=""
+  for d in "$HOME/Documents/Github/csk/gui/CSK" "$HOME/.csk/src/gui/CSK"; do
+    [ -f "$d/Package.swift" ] && gui_src="$d" && break
+  done
+
+  if [ -n "$gui_src" ] && command -v swift >/dev/null 2>&1; then
+    echo -e "  ${D}GUI 빌드 중...${R}"
+    (cd "$gui_src" && swift build -c release 2>&1 | tail -1)
+    local built="$gui_src/.build/release/CSK"
+    if [ -x "$built" ]; then
+      mkdir -p "$HOME/.csk/bin"
+      cp "$built" "$gui_bin"
+      "$gui_bin" &
+      echo -e "  ${G}✓${R} GUI 실행"
+      return
+    fi
+  fi
+
+  echo -e "  ${Y}!${R} GUI 바이너리를 찾을 수 없습니다" >&2
+  echo -e "  ${D}swift build 후 ~/.csk/bin/CSK 에 복사하세요${R}" >&2
+}
+
+cmd_version() { echo "csk $CSK_VERSION"; }
+
+cmd_usage() {
+  echo -e "
+  ${B}csk${R} — Claude Skills Kit v$CSK_VERSION
+
+  ${B}팩 관리${R}
+    csk install <pack>       스킬팩 설치
+    csk uninstall <pack>     스킬팩 제거
+    csk update [pack]        업데이트 (전체 또는 특정 팩)
+    csk packs                등록/설치된 팩 목록
+    csk add <n> <url> [cmd]  커스텀 팩 등록
+
+  ${B}스킬 관리${R}
+    csk ls                   전체 스킬 상태
+    csk on <skill|all>       스킬 켜기
+    csk off <skill|all>      스킬 끄기
+    csk t <skill>            토글
+
+  ${B}GUI${R}
+    csk gui                  SwiftUI 앱 실행
+
+  ${B}도움말${R}
+    csk help [skill|all]     스킬 설명 (한글)
+    csk -v                   버전
+"
+}
+
+# ─── Main ────────────────────────────────────────────────
+case "${1:-}" in
+  install|i)     [ -z "$2" ] && echo "csk install <pack>" >&2 && exit 1; cmd_install "$2" ;;
+  uninstall|rm)  [ -z "$2" ] && echo "csk uninstall <pack>" >&2 && exit 1; cmd_uninstall "$2" ;;
+  update|up)     cmd_update "${2:-}" ;;
+  packs|p)       cmd_packs ;;
+  add)           cmd_add_pack "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+  ls|list)       cmd_ls ;;
+  on|enable)     [ -z "$2" ] && echo "csk on <skill|all>" >&2 && exit 1; cmd_on "$2" ;;
+  off|disable)   [ -z "$2" ] && echo "csk off <skill|all>" >&2 && exit 1; cmd_off "$2" ;;
+  t|toggle)      [ -z "$2" ] && echo "csk t <skill>" >&2 && exit 1
+                 if skill_on? "$2"; then cmd_off "$2"; else cmd_on "$2"; fi ;;
+  h|help)        if [ -z "$2" ] || [ "$2" = "all" ]; then cmd_help_all; else cmd_help_one "$2"; fi ;;
+  gui)           cmd_gui ;;
+  -v|--version)  cmd_version ;;
+  -h|--help|"")  cmd_usage ;;
+  *)             echo -e "  ${Y}?${R} 알 수 없는 명령: $1\n" >&2; cmd_usage >&2; exit 1 ;;
+esac

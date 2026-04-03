@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.o
+*.d
+*.dia
+*.swiftdeps
+DerivedData/
+.omc/
